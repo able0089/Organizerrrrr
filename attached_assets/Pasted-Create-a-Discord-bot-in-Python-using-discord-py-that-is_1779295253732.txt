@@ -1,0 +1,172 @@
+Create a Discord bot in Python using discord.py that is optimized for Render free tier hosting.
+
+BOT PREFIX:
+d!
+
+MAIN PURPOSE:
+This bot automates Pokétwo reserve commands by reading manually-made checklist messages and sending reserve commands one-by-one automatically.
+
+IMPORTANT:
+The bot DOES NOT manage reserves itself.
+It ONLY reads checklist messages and sends commands like:
+h!r add ...
+h!r remove ...
+
+The reserve bot already exists separately.
+
+FEATURES REQUIRED:
+
+1. Reply-Based Parsing
+
+- Users reply to a checklist message using:
+  d!autores
+- The bot reads the replied message content.
+- The checklist is manually written by moderators.
+
+2. Supported Checklist Format
+
+Example checklist:
+
+Rares : @user + sewaddle
+Regionals : @user2 + charmander
+Eevos : @user3 + eternatus
+Gmax : @user4 + applin + all urshifu
+Res1 : @user5 popplio + paras
+Res2 : @user6 bulbasaur | @user7 chimchar
+
+3. Parsing Logic
+
+The bot should:
+
+- Detect category names
+- Detect user mentions
+- Detect Pokémon names
+- Detect multiple users split with |
+- Detect additional Pokémon split with +
+
+4. Category Mapping
+
+Map:
+Rares -> rare
+Regionals -> regional
+Eevos -> eevo
+Gmax -> gmax
+Res1 -> res1
+Res2 -> res2
+
+5. Command Generation Rules
+
+For:
+Rares : @user + sewaddle
+
+Generate:
+h!r add rare, sewaddle @user
+
+For:
+Regionals : @user2 + charmander
+
+Generate:
+h!r add regional, charmander @user2
+
+For:
+Eevos : @user3 + eternatus
+
+If eternatus was already reserved earlier:
+First send:
+h!r remove eternatus
+
+Then:
+h!r add eevo, eternatus @user3
+
+For:
+Gmax : @user4 + applin + all urshifu
+
+First send:
+h!r remove all urshifu
+
+Then:
+h!r add gmax, applin, all urshifu @user4
+
+For:
+Res1 : @user5 popplio + paras
+
+Generate:
+h!r add popplio, paras @user5
+
+For:
+Res2 : @user6 bulbasaur | @user7 chimchar
+
+Generate:
+h!r add bulbasaur @user6
+h!r add chimchar @user7
+
+6. Queue System
+
+- Commands must be sent ONE at a time.
+- Add 2 second delay between commands.
+- Use asyncio queue system.
+- Prevent overlapping autores sessions.
+
+7. Preview Mode
+   Add:
+   d!preview
+
+This should show all commands BEFORE sending them.
+
+8. Error Handling
+
+- Ignore failed remove commands.
+- Continue queue even if one command fails.
+- Prevent crashes.
+
+9. Render Free Tier Optimization
+   IMPORTANT:
+
+- Must be lightweight.
+- Avoid heavy databases.
+- Use simple in-memory storage.
+- Include keep-alive Flask server for Render uptime.
+- Use environment variables for token.
+- Avoid blocking loops.
+- Use async everywhere possible.
+
+10. Files Structure
+
+Create:
+main.py
+parser.py
+queue_manager.py
+keep_alive.py
+requirements.txt
+
+11. requirements.txt should include:
+    discord.py
+    flask
+
+12. Add detailed comments explaining:
+
+- parsing logic
+- queue logic
+- reply detection
+- command generation
+
+13. Bot should only respond to users with Manage Messages permission.
+
+14. Add clean console logging.
+
+15. Add anti-spam protection so only one autores runs per channel at a time.
+
+16. Make code beginner-friendly and easy to expand later.
+
+17. Use Python 3.11 compatible syntax.
+
+18. The bot should send generated commands directly into the Discord channel one-by-one.
+
+19. Add support for aliases:
+    all urshifu
+    all vivillon
+    etc
+
+using configurable dictionaries.
+
+20. Add TODO comments for future OCR screenshot support.
