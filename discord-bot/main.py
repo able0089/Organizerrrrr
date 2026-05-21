@@ -9,10 +9,16 @@ one-by-one with a short delay between them.
 
 Commands (prefix: d!)
 ---------------------
-d!autores   — Reply to a checklist message to parse and send all commands.
-d!preview   — Reply to a checklist message to see commands WITHOUT sending.
+d!autores          — Reply to a checklist message to parse and send all commands.
+d!preview          — Reply to a checklist message to see commands WITHOUT sending.
+d!setrole <role>   — Set which role is allowed to use d!autores / d!preview.
+                     Requires Administrator permission.
 
-Permissions required: Manage Messages (checked before every command).
+Access rules
+------------
+- Members with the role set via d!setrole can use d!autores and d!preview.
+- Administrators can always use all commands regardless of the set role.
+- If no role has been set yet, only Administrators can use the bot commands.
 
 Environment variables
 ---------------------
@@ -20,7 +26,6 @@ DISCORD_TOKEN   — Bot token from the Discord developer portal.
                   Set this in your Render dashboard (or a local .env file).
 """
 
-import asyncio
 import logging
 import os
 
@@ -54,13 +59,38 @@ bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
 # One QueueManager for the whole bot — it tracks active sessions per channel.
 queue_manager = QueueManager()
 
+# ---------------------------------------------------------------------------
+# In-memory role storage
+# Maps guild_id (int) -> role_id (int) of the allowed role.
+# This resets on bot restart — lightweight and dependency-free.
+# ---------------------------------------------------------------------------
+allowed_roles: dict[int, int] = {}
+
 
 # ---------------------------------------------------------------------------
-# Helper: permission check
+# Helper: access check
 # ---------------------------------------------------------------------------
-def has_manage_messages(ctx: commands.Context) -> bool:
-    """Return True if the invoking member has the Manage Messages permission."""
-    return ctx.author.guild_permissions.manage_messages
+def is_allowed(ctx: commands.Context) -> bool:
+    """
+    Return True if the invoking member may use bot commands.
+
+    Access is granted when ANY of the following is true:
+    1. The member has the Administrator permission (always allowed).
+    2. A role has been set for this guild via d!setrole AND the member has it.
+    """
+    member: discord.Member = ctx.author
+
+    # Administrators always have access.
+    if member.guild_permissions.administrator:
+        return True
+
+    # Check if the member holds the configured allowed role.
+    role_id = allowed_roles.get(ctx.guild.id)
+    if role_id is not None:
+        return any(role.id == role_id for role in member.roles)
+
+    # No role configured yet and member is not an admin — deny.
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +144,67 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
+@bot.command(name="setrole")
+async def setrole(ctx: commands.Context, *, role_input: str = ""):
+    """
+    Set which role is allowed to use d!autores and d!preview.
+    Only members with the Administrator permission can run this command.
+
+    Usage examples:
+        d!setrole @Moderator
+        d!setrole Moderator
+        d!setrole 123456789012345678   (role ID)
+    """
+    # Only administrators can configure the allowed role.
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.send("You need the **Administrator** permission to use this.")
+        return
+
+    if not role_input.strip():
+        await ctx.send(
+            "Please specify a role. Example: `d!setrole @Moderator`"
+        )
+        return
+
+    # Try to resolve the role from the converter first (handles mentions and IDs).
+    role: discord.Role | None = None
+
+    # Attempt 1: use discord's built-in role converter (handles mention + raw ID).
+    try:
+        role = await commands.RoleConverter().convert(ctx, role_input.strip())
+    except commands.BadArgument:
+        pass
+
+    # Attempt 2: case-insensitive name search as a fallback.
+    if role is None:
+        needle = role_input.strip().lower()
+        role = discord.utils.find(
+            lambda r: r.name.lower() == needle, ctx.guild.roles
+        )
+
+    if role is None:
+        await ctx.send(
+            f"Could not find a role matching **{role_input}**. "
+            "Try mentioning the role directly (e.g. `d!setrole @Moderator`) "
+            "or using its exact name."
+        )
+        return
+
+    # Store the role ID for this guild.
+    allowed_roles[ctx.guild.id] = role.id
+    logger.info(
+        "setrole: guild %s set allowed role to '%s' (%d) by %s",
+        ctx.guild.id,
+        role.name,
+        role.id,
+        ctx.author,
+    )
+    await ctx.send(
+        f"Done! Members with the **{role.name}** role can now use "
+        "`d!autores` and `d!preview`."
+    )
+
+
 @bot.command(name="autores")
 async def autores(ctx: commands.Context):
     """
@@ -122,9 +213,20 @@ async def autores(ctx: commands.Context):
 
     Usage:  Reply to a checklist message, then type  d!autores
     """
-    # --- Permission guard ---
-    if not has_manage_messages(ctx):
-        await ctx.send("You need the **Manage Messages** permission to use this.")
+    # --- Access guard ---
+    if not is_allowed(ctx):
+        role_id = allowed_roles.get(ctx.guild.id)
+        if role_id:
+            role = ctx.guild.get_role(role_id)
+            role_name = role.name if role else "the configured role"
+            await ctx.send(
+                f"You need the **{role_name}** role (or Administrator) to use this."
+            )
+        else:
+            await ctx.send(
+                "No allowed role has been set yet. An Administrator must run "
+                "`d!setrole <role>` first."
+            )
         return
 
     # --- Anti-spam: only one session per channel at a time ---
@@ -140,9 +242,7 @@ async def autores(ctx: commands.Context):
     if content is None:
         return
 
-    logger.info(
-        "autores triggered by %s in #%s", ctx.author, ctx.channel.name
-    )
+    logger.info("autores triggered by %s in #%s", ctx.author, ctx.channel.name)
 
     # --- Parse the checklist into commands ---
     # reserved_set is per-session; it lets later lines detect conflicts with
@@ -174,9 +274,20 @@ async def preview(ctx: commands.Context):
 
     Usage:  Reply to a checklist message, then type  d!preview
     """
-    # --- Permission guard ---
-    if not has_manage_messages(ctx):
-        await ctx.send("You need the **Manage Messages** permission to use this.")
+    # --- Access guard ---
+    if not is_allowed(ctx):
+        role_id = allowed_roles.get(ctx.guild.id)
+        if role_id:
+            role = ctx.guild.get_role(role_id)
+            role_name = role.name if role else "the configured role"
+            await ctx.send(
+                f"You need the **{role_name}** role (or Administrator) to use this."
+            )
+        else:
+            await ctx.send(
+                "No allowed role has been set yet. An Administrator must run "
+                "`d!setrole <role>` first."
+            )
         return
 
     # --- Fetch the checklist text ---
@@ -184,9 +295,7 @@ async def preview(ctx: commands.Context):
     if content is None:
         return
 
-    logger.info(
-        "preview triggered by %s in #%s", ctx.author, ctx.channel.name
-    )
+    logger.info("preview triggered by %s in #%s", ctx.author, ctx.channel.name)
 
     # --- Parse without affecting reserved_set (use a fresh one) ---
     reserved_set: set[str] = set()
@@ -200,12 +309,11 @@ async def preview(ctx: commands.Context):
     # Discord messages have a 2000 character limit, so chunk if needed.
     header = f"**Preview — {len(commands_list)} command(s) to send:**\n"
     lines = [f"`{i + 1}. {cmd}`" for i, cmd in enumerate(commands_list)]
-    body = "\n".join(lines)
-
-    full_message = header + body
 
     # Send in chunks if the message would exceed Discord's 2000-char limit.
     chunk_size = 1900
+    full_message = header + "\n".join(lines)
+
     if len(full_message) <= chunk_size:
         await ctx.send(full_message)
     else:
@@ -222,9 +330,7 @@ async def preview(ctx: commands.Context):
         if chunk:
             await ctx.send("\n".join(chunk))
 
-    logger.info(
-        "Preview shown to %s: %d commands", ctx.author, len(commands_list)
-    )
+    logger.info("Preview shown to %s: %d commands", ctx.author, len(commands_list))
 
 
 # ---------------------------------------------------------------------------
