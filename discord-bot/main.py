@@ -63,6 +63,11 @@ queue_manager = QueueManager()
 # In-memory store: guild_id -> role_id of the configured allowed role.
 allowed_roles: dict[int, int] = {}
 
+# Persistent per-guild reserved set — survives across multiple d!autores runs
+# so that pokemon reserved in run #1 are still "known" when run #2 checks for
+# conflicts.  Use d!clearres to wipe this between reserve cycles.
+guild_reserved: dict[int, set[str]] = {}
+
 
 # ---------------------------------------------------------------------------
 # Access helpers
@@ -216,6 +221,15 @@ async def help_cmd(ctx: commands.Context):
         inline=False,
     )
     embed.add_field(
+        name="`d!clearres`",
+        value=(
+            "Wipe the server's reserved-pokemon memory. "
+            "Run this at the start of a new reserve cycle so stale reservations "
+            "don't cause unwanted `h!r remove` commands."
+        ),
+        inline=False,
+    )
+    embed.add_field(
         name="`d!help`",
         value="Show this message.",
         inline=False,
@@ -283,7 +297,12 @@ async def autores(ctx: commands.Context):
 
     logger.info("autores triggered by %s in #%s", ctx.author, ctx.channel.name)
 
-    reserved_set: set[str] = set()
+    # Use the guild's persistent reserved set so pokemon reserved in previous
+    # runs are still known and trigger remove commands if they reappear.
+    if ctx.guild.id not in guild_reserved:
+        guild_reserved[ctx.guild.id] = set()
+    reserved_set = guild_reserved[ctx.guild.id]
+
     commands_list = parse_checklist(content, reserved_set)
 
     if not commands_list:
@@ -291,12 +310,32 @@ async def autores(ctx: commands.Context):
         return
 
     await ctx.send(f"Starting autores — sending **{len(commands_list)}** command(s)...")
-    logger.info("Queuing %d commands for #%s", len(commands_list), ctx.channel.name)
+    logger.info(
+        "Queuing %d commands for #%s (guild reserved pool: %d pokemon)",
+        len(commands_list), ctx.channel.name, len(reserved_set),
+    )
 
     try:
         queue_manager.start_session(ctx.channel, commands_list)
     except RuntimeError as exc:
         await ctx.send(str(exc))
+
+
+@bot.command(name="clearres")
+async def clearres(ctx: commands.Context):
+    """
+    Wipe the server's persistent reserved-pokemon memory.
+    Run this at the start of a new reserve cycle so old reservations don't
+    trigger unwanted remove commands.
+    """
+    if not is_allowed(ctx):
+        await ctx.send(_access_denied_message(ctx))
+        return
+
+    count = len(guild_reserved.get(ctx.guild.id, set()))
+    guild_reserved[ctx.guild.id] = set()
+    logger.info("clearres: guild %s wiped %d reserved entries by %s", ctx.guild.id, count, ctx.author)
+    await ctx.send(f"Done! Reserved-pokemon memory cleared ({count} entries removed).")
 
 
 @bot.command(name="preview")
