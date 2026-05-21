@@ -4,47 +4,69 @@ parser.py
 Responsible for turning a raw checklist message into a flat list of
 Discord commands that will later be queued and sent one-by-one.
 
-Checklist format example
-------------------------
-Rares : @user + sewaddle
-Regionals : @user2 + charmander
-Eevos : @user3 + eternatus
-Gmax : @user4 + applin + all urshifu
-Res1 : @user5 popplio + paras
-Res2 : @user6 bulbasaur | @user7 chimchar
+Real-world checklist format (as used in production)
+----------------------------------------------------
+RARE #🔷| 1-rares to #🔷| 20 : @Able +cyndaquil
+REGIONAL #🔷| 21-regionals to #🔷| 35 : @Dusky +ditto
+EEVOS #🔷| 36-eevos to #🔷| 45 : @Able + missingno
+GMAX #🔷| 46-gmax to #🔷| 55 : @Dusky + all urshifu
+EVENT1 #🔷| 56-paradox to #🔷| 70 : @Able cicada vikavolt
+EVENT2 #🔷| 71 to #🔷| 85 :
+PARADOX #🔷| 86-res-1 to #🔷| 92 : @Dusky
+RES1 #🔷| 93 to #🔷| 96-res-3 :
+RES2 #🔷| 97 to #🔷| 100 : @Able poliwag | @Dusky all arceus
+
+Key parsing insight
+-------------------
+- The CATEGORY NAME is always the very first word of the line.
+- There is always a ':' that separates the channel/number info from the
+  user+pokemon section. Everything AFTER THE LAST ':' is user+pokemon data.
+- This safely ignores whatever text sits between the category and the colon.
 """
 
 import re
 
 # ---------------------------------------------------------------------------
-# Category mapping: checklist label -> reserve category slug used in commands.
-# Categories that map to None use NO category slug in the generated command
-# (see Res1 / Res2 below).
+# Category mapping: first word of line (lowercase) -> reserve slug.
+#
+# Categories with a slug   → command uses:  h!r add <slug>, <pokemon> @user
+# Categories with None     → command uses:  h!r add <pokemon> @user  (no slug)
 # ---------------------------------------------------------------------------
-CATEGORY_MAP = {
+CATEGORY_MAP: dict[str, str | None] = {
+    # --- Reserve categories (slug included in command) ---
+    "rare":      "rare",
     "rares":     "rare",
+    "regional":  "regional",
     "regionals": "regional",
+    "eevo":      "eevo",
     "eevos":     "eevo",
     "gmax":      "gmax",
+    "paradox":   "paradox",
+    # --- Non-reserve categories (NO slug in command) ---
+    "event1":    None,
+    "event2":    None,
+    "event3":    None,
     "res1":      None,
     "res2":      None,
+    "res3":      None,
 }
 
 # ---------------------------------------------------------------------------
-# Alias dictionary: certain Pokémon names are multi-word tokens.
-# Add any additional aliases here without touching parsing logic.
-# Keys are lowercase, values are the exact string sent in the command.
+# Alias dictionary: multi-word Pokémon tokens that must NOT be split on
+# spaces or '+'.  Keys are lowercase; values are sent verbatim in commands.
+# Add new aliases here without touching any other code.
 # ---------------------------------------------------------------------------
-ALIASES = {
-    "all urshifu":  "all urshifu",
-    "all vivillon": "all vivillon",
-    # Add more as needed, e.g.:
-    # "all calyrex": "all calyrex",
+ALIASES: dict[str, str] = {
+    "all urshifu":   "all urshifu",
+    "all vivillon":  "all vivillon",
+    "all arceus":    "all arceus",
+    "all calyrex":   "all calyrex",
+    # Add more multi-word aliases here as needed.
 }
 
-# A compiled pattern that matches any known alias (longest first to avoid
-# partial matches, e.g. "all urshifu" before "urshifu").
-_ALIAS_PATTERN = re.compile(
+# Pre-compile a regex that matches any alias (longest first to prevent
+# partial matches, e.g. match "all urshifu" before plain "urshifu").
+_ALIAS_PATTERN: re.Pattern | None = re.compile(
     "|".join(
         re.escape(alias) for alias in sorted(ALIASES, key=len, reverse=True)
     ),
@@ -52,22 +74,25 @@ _ALIAS_PATTERN = re.compile(
 ) if ALIASES else None
 
 
-def _normalize(text: str) -> str:
-    """Strip surrounding whitespace and lowercase for comparisons."""
-    return text.strip().lower()
-
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
 def _extract_pokemon_tokens(raw: str) -> list[str]:
     """
-    Split a raw Pokémon string (e.g. "applin + all urshifu") into a list of
-    individual Pokémon tokens, correctly handling multi-word aliases.
+    Split a raw Pokémon string into individual tokens while correctly
+    preserving multi-word aliases (e.g. "all urshifu").
 
-    Strategy:
-    1. Replace each known alias with a placeholder so the alias text is not
-       accidentally split on '+' or whitespace inside it.
-    2. Split the remaining text on '+'.
-    3. Restore placeholders back to alias strings.
+    Splitting rules:
+    - If '+' is present  → split on '+'.
+    - If no '+' present  → split on whitespace (handles "cicada vikavolt").
+    Aliases are protected from splitting via placeholder substitution.
     """
+    raw = raw.strip()
+    if not raw:
+        return []
+
+    # Step 1: Replace known aliases with opaque placeholders.
     placeholders: dict[str, str] = {}
 
     def _replace_alias(match: re.Match) -> str:
@@ -78,162 +103,155 @@ def _extract_pokemon_tokens(raw: str) -> list[str]:
     if _ALIAS_PATTERN:
         raw = _ALIAS_PATTERN.sub(_replace_alias, raw)
 
-    # Split on '+' and clean up each token.
-    parts = [p.strip() for p in raw.split("+") if p.strip()]
+    # Step 2: Split — prefer '+' as explicit separator, else use whitespace.
+    if "+" in raw:
+        parts = [p.strip() for p in raw.split("+") if p.strip()]
+    else:
+        parts = [p.strip() for p in raw.split() if p.strip()]
 
-    # Restore alias placeholders.
-    tokens = []
+    # Step 3: Restore alias placeholders in each token.
+    tokens: list[str] = []
     for part in parts:
-        for placeholder, alias_value in placeholders.items():
-            part = part.replace(placeholder, alias_value)
-        tokens.append(part.strip())
+        for key, alias_value in placeholders.items():
+            part = part.replace(key, alias_value)
+        token = part.strip()
+        if token:
+            tokens.append(token)
 
-    return [t for t in tokens if t]
+    return tokens
 
 
 def _parse_user_segment(segment: str) -> tuple[str, list[str]]:
     """
-    Parse one user segment of the form:
-        @mention  pokemon1 + pokemon2 ...
-    or (when the separator between mention and Pokémon list is already split off):
-        @mention
+    Parse one user segment such as "@mention +pokemon1 + pokemon2" or
+    "@mention pokemon1 pokemon2" into (mention_string, [pokemon_tokens]).
 
-    Returns (mention_string, [pokemon_tokens]).
+    Returns ("", []) when no valid Discord mention is found.
     """
     segment = segment.strip()
 
-    # Find the user mention (<@id> or <@!id>).
     mention_match = re.search(r"<@!?\d+>", segment)
     if not mention_match:
-        return ("", [])
+        return "", []
 
     mention = mention_match.group(0)
-    # Everything after the mention is the Pokémon list for this user.
-    after_mention = segment[mention_match.end():].strip()
-
-    # Remove a leading '+' separator if present.
-    after_mention = after_mention.lstrip("+").strip()
+    after_mention = segment[mention_match.end():].strip().lstrip("+").strip()
 
     pokemon_tokens = _extract_pokemon_tokens(after_mention) if after_mention else []
     return mention, pokemon_tokens
 
 
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 def parse_checklist(message_content: str, reserved_set: set[str]) -> list[str]:
     """
     Parse a full checklist message and return an ordered list of command
-    strings ready to send in Discord.
+    strings ready to be sent in Discord.
 
     Parameters
     ----------
     message_content : str
-        The raw text of the checklist message that was replied to.
+        Raw text of the checklist message that was replied to.
     reserved_set : set[str]
-        A mutable set of Pokémon names (lowercase) that have already been
-        reserved during this autores session.  The function updates this set
-        as it processes the checklist so that later lines can detect
-        conflicts with earlier ones.
+        Mutable set of lowercase Pokémon names already reserved this session.
+        Updated in-place so later lines can detect conflicts.
 
     Returns
     -------
     list[str]
-        Ordered list of command strings, e.g.
+        Ordered commands, e.g.:
         ["h!r remove eternatus", "h!r add eevo, eternatus @user3"]
     """
     commands: list[str] = []
-    lines = message_content.strip().splitlines()
 
-    for line in lines:
-        line = line.strip()
+    for raw_line in message_content.strip().splitlines():
+        line = raw_line.strip()
         if not line:
             continue
 
         # ------------------------------------------------------------------
-        # Step 1: Detect the category prefix by splitting on the first ':'.
-        # Expected format:  CategoryLabel : rest_of_line
+        # Step 1: Extract category name — always the FIRST word of the line.
+        # ------------------------------------------------------------------
+        first_word = line.split()[0].lower().rstrip(":")
+
+        if first_word not in CATEGORY_MAP:
+            continue  # Not a recognised category; skip silently.
+
+        category_slug = CATEGORY_MAP[first_word]  # str or None
+
+        # ------------------------------------------------------------------
+        # Step 2: Extract user+pokemon section — everything AFTER THE LAST
+        # ':' in the line.  This skips over channel names / number ranges
+        # that appear between the category name and the actual data.
         # ------------------------------------------------------------------
         if ":" not in line:
-            continue  # Not a valid checklist line; skip silently.
+            continue
 
-        category_raw, _, remainder = line.partition(":")
-        category_key = _normalize(category_raw)
+        user_section = line.rsplit(":", 1)[1].strip()
 
-        if category_key not in CATEGORY_MAP:
-            continue  # Unknown category; skip silently.
-
-        category_slug = CATEGORY_MAP[category_key]  # May be None for Res1/Res2.
-        remainder = remainder.strip()
+        if not user_section:
+            continue  # Line has a category but no user/pokemon data; skip.
 
         # ------------------------------------------------------------------
-        # Step 2: Handle Res2-style lines where multiple users are separated
-        # by '|'.  Each sub-segment belongs to one user.
+        # Step 3: Split on '|' to handle multiple users on the same line
+        # (e.g. RES2 ... : @user1 poliwag | @user2 all arceus).
+        # NOTE: '|' characters inside the channel-info section (before ':')
+        # are already excluded because we only look at user_section.
         # ------------------------------------------------------------------
-        user_segments = [seg.strip() for seg in remainder.split("|")]
+        user_segments = [seg.strip() for seg in user_section.split("|")]
 
         for segment in user_segments:
             if not segment:
                 continue
 
-            # ----------------------------------------------------------------
-            # Step 3: Parse mention and Pokémon list from this user segment.
-            # The format within a segment can be:
-            #   @mention + pokemon1 + pokemon2
-            #   @mention pokemon1 + pokemon2   (Res1 style, space separator)
-            # We always locate the mention first, then treat everything after
-            # it as the Pokémon token string.
-            # ----------------------------------------------------------------
+            # --------------------------------------------------------------
+            # Step 4: Parse the mention and Pokémon list from this segment.
+            # --------------------------------------------------------------
             mention, pokemon_tokens = _parse_user_segment(segment)
 
-            if not mention:
-                continue  # No valid mention found; skip this segment.
+            if not mention or not pokemon_tokens:
+                continue
 
-            if not pokemon_tokens:
-                continue  # No Pokémon listed; nothing to add.
-
-            # ----------------------------------------------------------------
-            # Step 4: Generate remove commands where needed.
+            # --------------------------------------------------------------
+            # Step 5: Insert 'h!r remove' commands where required.
             #
             # Rules:
-            #   a) Any "all X" alias token always gets a remove command first.
-            #   b) For Eevos (category_slug == "eevo"), if the Pokémon was
-            #      already in reserved_set (reserved earlier this session),
-            #      it also needs a remove command first.
-            # ----------------------------------------------------------------
+            #   a) Any multi-word "all X" alias always gets a remove first
+            #      (it represents a category-wide hold that must be freed).
+            #   b) For eevo lines: if the Pokémon was already reserved
+            #      earlier this session, remove it first before re-adding.
+            # --------------------------------------------------------------
             for token in pokemon_tokens:
                 token_lower = token.lower()
                 is_alias = token_lower in ALIASES
 
-                needs_remove = False
-
-                if is_alias:
-                    # Always remove "all X" style aliases before re-adding.
-                    needs_remove = True
-                elif category_slug == "eevo" and token_lower in reserved_set:
-                    # Eevo Pokémon that was already reserved this session.
-                    needs_remove = True
+                needs_remove = (
+                    is_alias
+                    or (category_slug == "eevo" and token_lower in reserved_set)
+                )
 
                 if needs_remove:
                     commands.append(f"h!r remove {token}")
 
-            # ----------------------------------------------------------------
-            # Step 5: Generate the add command.
+            # --------------------------------------------------------------
+            # Step 6: Generate the add command.
             #
-            # Format depends on whether there is a category slug:
-            #   With slug:    h!r add <slug>, pokemon1, pokemon2 @mention
-            #   Without slug: h!r add pokemon1, pokemon2 @mention
-            # ----------------------------------------------------------------
+            #   With category slug:  h!r add <slug>, p1, p2 @mention
+            #   Without slug:        h!r add p1, p2 @mention
+            # --------------------------------------------------------------
             pokemon_list_str = ", ".join(pokemon_tokens)
 
             if category_slug:
-                add_cmd = f"h!r add {category_slug}, {pokemon_list_str} {mention}"
+                commands.append(f"h!r add {category_slug}, {pokemon_list_str} {mention}")
             else:
-                add_cmd = f"h!r add {pokemon_list_str} {mention}"
+                commands.append(f"h!r add {pokemon_list_str} {mention}")
 
-            commands.append(add_cmd)
-
-            # ----------------------------------------------------------------
-            # Step 6: Update reserved_set so subsequent lines know what has
-            # been reserved so far in this session.
-            # ----------------------------------------------------------------
+            # --------------------------------------------------------------
+            # Step 7: Mark these Pokémon as reserved for conflict detection
+            # on later lines in the same session.
+            # --------------------------------------------------------------
             for token in pokemon_tokens:
                 reserved_set.add(token.lower())
 
