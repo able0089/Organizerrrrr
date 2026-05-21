@@ -102,21 +102,63 @@ def _access_denied_message(ctx: commands.Context) -> str:
 # Shared helper: fetch replied-to message content
 # ---------------------------------------------------------------------------
 
+def _clean_content(text: str) -> str:
+    """
+    Strip Discord markdown bold/italic markers (**text**, *text*) so the
+    parser sees plain category and pokemon names even when the checklist was
+    written with bold formatting.
+    """
+    # Remove bold (**) and italic (*) markers — do bold first (longer match).
+    text = text.replace("**", "")
+    text = text.replace("*", "")
+    return text
+
+
 async def get_replied_content(ctx: commands.Context) -> str | None:
+    """
+    Return the plain-text content of the message the user replied to.
+
+    Handles three cases:
+    1. Normal reply       — fetch the referenced message directly.
+    2. Forwarded message  — the forwarded message's content lives in
+                            message_snapshots, not in .content.
+    3. Resolved reference — fall back to ref.resolved if fetch fails.
+    """
     ref = ctx.message.reference
     if ref is None:
         await ctx.send("You must **reply** to a checklist message when using this command.")
         return None
+
+    content = ""
+
+    # Case 1 & 2: fetch the replied-to message then check message_snapshots.
     try:
         replied_msg = await ctx.channel.fetch_message(ref.message_id)
-    except discord.NotFound:
-        await ctx.send("Could not find the message you replied to.")
-        return None
-    content = replied_msg.content.strip()
+        content = replied_msg.content.strip()
+
+        # Forwarded messages have empty .content — the real text is in
+        # message_snapshots (discord.py 2.4+).
+        if not content:
+            snapshots = getattr(replied_msg, "message_snapshots", None)
+            if snapshots:
+                content = snapshots[0].message.content.strip()
+
+    except (discord.NotFound, discord.HTTPException):
+        pass
+
+    # Case 3: fall back to the resolved reference object if we still have nothing.
+    if not content and ref.resolved and hasattr(ref.resolved, "content"):
+        content = ref.resolved.content.strip()
+
     if not content:
-        await ctx.send("The replied message appears to be empty.")
+        await ctx.send(
+            "Could not read the replied message. "
+            "If it is a forwarded message, make sure the bot has permission to read "
+            "the channel it was forwarded from."
+        )
         return None
-    return content
+
+    return _clean_content(content)
 
 
 # ---------------------------------------------------------------------------

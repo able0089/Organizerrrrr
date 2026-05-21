@@ -64,16 +64,36 @@ CATEGORY_MAP: dict[str, str | None] = {
 }
 
 # ---------------------------------------------------------------------------
-# Tokens that always need an  h!r remove  command sent before re-adding.
-# These are typically category-wide holds (e.g. "all urshifu").
-# Add new entries here as needed — no other code needs to change.
+# Tokens that ALWAYS need an  h!r remove  before re-adding, regardless of
+# whether they appear in reserved_set.  These are category-wide holds.
+# Add new "all X" entries here as needed — no other code changes required.
 # ---------------------------------------------------------------------------
 ALWAYS_REMOVE: set[str] = {
+    # Rare — all-form pokemon
+    "all arceus",
+    "all articuno",
+    "all deoxys",
+    "all genesect",
+    "all marshadow",
+    "all meloetta",
+    "all moltres",
+    # Gmax
+    "all alcremie",
+    # Other multi-form aliases
     "all urshifu",
     "all vivillon",
-    "all arceus",
     "all calyrex",
+    "all zapdos",
+    "all moltres",
+    "all landorus",
+    "all tornadus",
+    "all thundurus",
+    "all enamorus",
 }
+
+# Categories where a pokemon that was already reserved earlier in the same
+# session should be removed before being re-added to a new user.
+CONFLICT_CATEGORIES: set[str] = {"rare", "regional", "gmax", "eevos"}
 
 
 # ---------------------------------------------------------------------------
@@ -211,11 +231,14 @@ def parse_checklist(message_content: str, reserved_set: set[str]) -> list[str]:
 
             # Step 5 — Prepend remove commands where needed.
             #   a) Tokens in ALWAYS_REMOVE always get removed first.
-            #   b) Eevos pokemon already reserved this session get removed.
+            #   b) For rare/regional/gmax/eevos: if the pokemon was already
+            #      reserved earlier this session (different user), remove it
+            #      first so the new reservation doesn't conflict.
             for token in pokemon_tokens:
                 token_lower = token.lower()
                 needs_remove = token_lower in ALWAYS_REMOVE or (
-                    category_slug == "eevos" and token_lower in reserved_set
+                    category_slug in CONFLICT_CATEGORIES
+                    and token_lower in reserved_set
                 )
                 if needs_remove:
                     commands.append(f"h!r remove {token}")
