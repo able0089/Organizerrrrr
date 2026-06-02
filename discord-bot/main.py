@@ -164,13 +164,16 @@ async def _resume_channel(
     poketwo: discord.Member,
 ) -> bool:
     """
-    Remove the deny override for Pokétwo in one channel (restores defaults).
+    Explicitly ALLOW Send Messages + View Channel for Pokétwo in one channel.
+    This sets a green checkmark override rather than just removing the deny,
+    ensuring Pokétwo can post even if a category-level deny exists.
     Returns True on success, False on permission error.
     """
     try:
         await channel.set_permissions(
             poketwo,
-            overwrite=None,
+            send_messages=True,
+            view_channel=True,
             reason="AutoRes: incense resume",
         )
         logger.info("Resumed Pokétwo in #%s", channel.name)
@@ -301,10 +304,7 @@ async def on_message(message: discord.Message):
 
     success = await _pause_channel(message.channel, poketwo)
     if success:
-        await message.channel.send(
-            "⏸️ Pokétwo has been paused in this channel (incense detected).\n"
-            f"Use `{BOT_PREFIX}r` to resume when the incense is done."
-        )
+        await message.channel.send("⏸️ Channel paused.")
 
 
 # ---------------------------------------------------------------------------
@@ -611,6 +611,18 @@ async def resume_cmd(ctx: commands.Context, *, arg: str = ""):
                 "Failed to resume Pokétwo here. "
                 "Make sure the bot has **Manage Channel** permissions."
             )
+
+
+# --- d!ping ----------------------------------------------------------------
+
+@bot.command(name="ping")
+async def ping_cmd(ctx: commands.Context):
+    """Check the bot's latency."""
+    if not is_allowed(ctx):
+        await ctx.send(_access_denied_message(ctx))
+        return
+    latency_ms = round(bot.latency * 1000)
+    await ctx.send(f"🏓 Pong! Latency: **{latency_ms} ms**")
 
 
 # --- d!clearres ------------------------------------------------------------
