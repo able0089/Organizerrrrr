@@ -5,26 +5,35 @@ Entry point for the AutoRes Discord bot.
 
 Commands (prefix: d!)
 ---------------------
-d!autores          — Reply to a checklist message to parse and send all commands.
-d!preview          — Reply to a checklist message to preview commands first.
-d!setrole <role>   — Set which role is allowed to use ALL bot commands.
-                     Requires Administrator permission.
-d!help             — Show this help message (access-gated).
+d!autores                    — Reply to a checklist message to parse and send all commands.
+d!preview                    — Reply to a checklist message to preview commands first.
+d!setrole <role>             — Set which role can use all bot commands (Admin only).
+d!set category <name/ID>     — Register a Discord category for pause/resume (Admin only).
+d!p                          — Pause Pokétwo in the current channel.
+d!p all                      — Pause Pokétwo in every channel in the registered category.
+d!r                          — Resume Pokétwo in the current channel.
+d!r all                      — Resume Pokétwo in every channel in the registered category.
+d!clearres                   — Wipe the server's reserved-pokemon memory.
+d!help                       — Show this message (access-gated).
+
+Auto-pause
+----------
+When Pokétwo sends an incense-purchase message in a channel that belongs to the
+registered category, the bot automatically pauses that channel.
 
 Access rules
 ------------
-- ALL commands (including d!help) require either:
-    • Administrator permission, OR
-    • The role configured via d!setrole
-- If no role has been set yet, only Administrators can use the bot.
+- ALL commands require Administrator OR the role set via d!setrole.
+- d!set category and d!setrole additionally require Administrator.
 
 Environment variables
 ---------------------
-DISCORD_TOKEN   — Bot token (set in Render dashboard or local .env).
+DISCORD_TOKEN   — Bot token (Render dashboard or local .env).
 """
 
 import logging
 import os
+import re
 
 import discord
 from discord.ext import commands
@@ -44,28 +53,40 @@ logging.basicConfig(
 logger = logging.getLogger("autobot")
 
 # ---------------------------------------------------------------------------
-# Bot setup — disable the built-in help command so we can replace it with
-# our own access-gated version.
+# Constants
 # ---------------------------------------------------------------------------
-BOT_PREFIX = "d!"
+BOT_PREFIX  = "d!"
+POKETWO_ID  = 716390085896962058   # Pokétwo's Discord user/bot ID
 
+# Detects any incense-purchase message sent by Pokétwo.
+INCENSE_PATTERN = re.compile(
+    r"(?:purchased|bought)\s+an?\s+incense"
+    r"|incense\s+(?:purchased|bought|activated)"
+    r"|you\s+purchased\s+an?\s+incense",
+    re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# Bot setup
+# ---------------------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(
     command_prefix=BOT_PREFIX,
     intents=intents,
-    help_command=None,  # Disable default help so we control access to it.
+    help_command=None,   # Replaced with our own access-gated version.
 )
 
 queue_manager = QueueManager()
 
-# In-memory store: guild_id -> role_id of the configured allowed role.
+# guild_id -> role_id  (role allowed to use all bot commands)
 allowed_roles: dict[int, int] = {}
 
-# Persistent per-guild reserved set — survives across multiple d!autores runs
-# so that pokemon reserved in run #1 are still "known" when run #2 checks for
-# conflicts.  Use d!clearres to wipe this between reserve cycles.
+# guild_id -> category_id  (registered Discord category for pause/resume)
+guild_categories: dict[int, int] = {}
+
+# guild_id -> set of lowercase pokemon names reserved this cycle
 guild_reserved: dict[int, set[str]] = {}
 
 
@@ -74,24 +95,17 @@ guild_reserved: dict[int, set[str]] = {}
 # ---------------------------------------------------------------------------
 
 def is_allowed(ctx: commands.Context) -> bool:
-    """
-    Return True if the member may use any bot command.
-    Granted when the member is an Administrator OR has the configured role.
-    """
+    """Administrator OR member with the configured allowed role."""
     member: discord.Member = ctx.author
-
     if member.guild_permissions.administrator:
         return True
-
     role_id = allowed_roles.get(ctx.guild.id)
     if role_id is not None:
         return any(r.id == role_id for r in member.roles)
-
     return False
 
 
 def _access_denied_message(ctx: commands.Context) -> str:
-    """Build a human-readable denial message for the invoking guild."""
     role_id = allowed_roles.get(ctx.guild.id)
     if role_id:
         role = ctx.guild.get_role(role_id)
@@ -104,16 +118,88 @@ def _access_denied_message(ctx: commands.Context) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Pause / resume helpers
+# ---------------------------------------------------------------------------
+
+async def _get_poketwo(guild: discord.Guild) -> discord.Member | None:
+    """Return the Pokétwo member object, fetching from API if not cached."""
+    member = guild.get_member(POKETWO_ID)
+    if member is None:
+        try:
+            member = await guild.fetch_member(POKETWO_ID)
+        except discord.NotFound:
+            return None
+        except discord.HTTPException:
+            return None
+    return member
+
+
+async def _pause_channel(
+    channel: discord.TextChannel,
+    poketwo: discord.Member,
+) -> bool:
+    """
+    Deny Send Messages + View Channel for Pokétwo in one channel.
+    Returns True on success, False on permission error.
+    """
+    try:
+        await channel.set_permissions(
+            poketwo,
+            send_messages=False,
+            view_channel=False,
+            reason="AutoRes: incense pause",
+        )
+        logger.info("Paused Pokétwo in #%s", channel.name)
+        return True
+    except discord.Forbidden:
+        logger.warning("Missing permissions to pause #%s", channel.name)
+        return False
+    except discord.HTTPException as exc:
+        logger.warning("HTTP error pausing #%s: %s", channel.name, exc)
+        return False
+
+
+async def _resume_channel(
+    channel: discord.TextChannel,
+    poketwo: discord.Member,
+) -> bool:
+    """
+    Remove the deny override for Pokétwo in one channel (restores defaults).
+    Returns True on success, False on permission error.
+    """
+    try:
+        await channel.set_permissions(
+            poketwo,
+            overwrite=None,
+            reason="AutoRes: incense resume",
+        )
+        logger.info("Resumed Pokétwo in #%s", channel.name)
+        return True
+    except discord.Forbidden:
+        logger.warning("Missing permissions to resume #%s", channel.name)
+        return False
+    except discord.HTTPException as exc:
+        logger.warning("HTTP error resuming #%s: %s", channel.name, exc)
+        return False
+
+
+def _registered_text_channels(guild: discord.Guild) -> list[discord.TextChannel]:
+    """Return all text channels inside the guild's registered category."""
+    cat_id = guild_categories.get(guild.id)
+    if cat_id is None:
+        return []
+    category = guild.get_channel(cat_id)
+    if not isinstance(category, discord.CategoryChannel):
+        return []
+    return [ch for ch in category.channels if isinstance(ch, discord.TextChannel)]
+
+
+# ---------------------------------------------------------------------------
 # Shared helper: fetch replied-to message content
 # ---------------------------------------------------------------------------
 
 def _clean_content(text: str) -> str:
-    """
-    Strip Discord markdown bold/italic markers (**text**, *text*) so the
-    parser sees plain category and pokemon names even when the checklist was
-    written with bold formatting.
-    """
-    # Remove bold (**) and italic (*) markers — do bold first (longer match).
+    """Strip Discord bold (**) and italic (*) markers from text."""
     text = text.replace("**", "")
     text = text.replace("*", "")
     return text
@@ -121,13 +207,9 @@ def _clean_content(text: str) -> str:
 
 async def get_replied_content(ctx: commands.Context) -> str | None:
     """
-    Return the plain-text content of the message the user replied to.
-
-    Handles three cases:
-    1. Normal reply       — fetch the referenced message directly.
-    2. Forwarded message  — the forwarded message's content lives in
-                            message_snapshots, not in .content.
-    3. Resolved reference — fall back to ref.resolved if fetch fails.
+    Return plain-text content of the message the user replied to.
+    Handles normal replies, forwarded messages (message_snapshots), and
+    resolved references.
     """
     ref = ctx.message.reference
     if ref is None:
@@ -136,30 +218,24 @@ async def get_replied_content(ctx: commands.Context) -> str | None:
 
     content = ""
 
-    # Case 1 & 2: fetch the replied-to message then check message_snapshots.
     try:
         replied_msg = await ctx.channel.fetch_message(ref.message_id)
         content = replied_msg.content.strip()
-
-        # Forwarded messages have empty .content — the real text is in
-        # message_snapshots (discord.py 2.4+).
         if not content:
             snapshots = getattr(replied_msg, "message_snapshots", None)
             if snapshots:
                 content = snapshots[0].message.content.strip()
-
     except (discord.NotFound, discord.HTTPException):
         pass
 
-    # Case 3: fall back to the resolved reference object if we still have nothing.
     if not content and ref.resolved and hasattr(ref.resolved, "content"):
         content = ref.resolved.content.strip()
 
     if not content:
         await ctx.send(
             "Could not read the replied message. "
-            "If it is a forwarded message, make sure the bot has permission to read "
-            "the channel it was forwarded from."
+            "If it is a forwarded message, make sure the bot has permission to "
+            "read the channel it was forwarded from."
         )
         return None
 
@@ -183,13 +259,61 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     logger.error("Unhandled command error: %s", error)
 
 
+@bot.event
+async def on_message(message: discord.Message):
+    """
+    Auto-pause: when Pokétwo announces an incense purchase in a channel that
+    belongs to the registered category, immediately pause that channel.
+    """
+    # Let command processing run first.
+    await bot.process_commands(message)
+
+    # Only act on Pokétwo messages in a guild.
+    if message.author.id != POKETWO_ID:
+        return
+    if message.guild is None:
+        return
+
+    # Only in channels that belong to the registered category.
+    registered = _registered_text_channels(message.guild)
+    if message.channel not in registered:
+        return
+
+    # Check for incense purchase keywords.
+    if not INCENSE_PATTERN.search(message.content):
+        # Also check embeds (Pokétwo sometimes uses embeds).
+        embed_text = " ".join(
+            (e.title or "") + " " + (e.description or "")
+            for e in message.embeds
+        )
+        if not INCENSE_PATTERN.search(embed_text):
+            return
+
+    logger.info(
+        "Incense purchase detected in #%s — auto-pausing Pokétwo.",
+        message.channel.name,
+    )
+
+    poketwo = await _get_poketwo(message.guild)
+    if poketwo is None:
+        logger.warning("Pokétwo member not found in guild %s", message.guild.id)
+        return
+
+    success = await _pause_channel(message.channel, poketwo)
+    if success:
+        await message.channel.send(
+            "⏸️ Pokétwo has been paused in this channel (incense detected).\n"
+            f"Use `{BOT_PREFIX}r` to resume when the incense is done."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
 @bot.command(name="help")
 async def help_cmd(ctx: commands.Context):
-    """Show all available commands. Access-gated."""
+    """Show all available commands."""
     if not is_allowed(ctx):
         await ctx.send(_access_denied_message(ctx))
         return
@@ -201,10 +325,14 @@ async def help_cmd(ctx: commands.Context):
     else:
         access_line = "Access: **Administrators only** (use `d!setrole` to open access)"
 
-    embed = discord.Embed(
-        title="AutoRes Bot — Commands",
-        color=discord.Color.blurple(),
-    )
+    cat_id = guild_categories.get(ctx.guild.id)
+    if cat_id:
+        cat = ctx.guild.get_channel(cat_id)
+        cat_line = f"Registered category: **{cat.name if cat else cat_id}**"
+    else:
+        cat_line = "No category registered yet — use `d!set category <name/ID>`"
+
+    embed = discord.Embed(title="AutoRes Bot — Commands", color=discord.Color.blurple())
     embed.add_field(
         name="`d!autores`",
         value="Reply to a checklist message to parse it and send all `h!r` commands automatically.",
@@ -216,27 +344,109 @@ async def help_cmd(ctx: commands.Context):
         inline=False,
     )
     embed.add_field(
+        name="`d!p`",
+        value="Pause Pokétwo in **this channel** (deny Send Messages + View Channel).",
+        inline=False,
+    )
+    embed.add_field(
+        name="`d!p all`",
+        value="Pause Pokétwo in **every channel** in the registered category.",
+        inline=False,
+    )
+    embed.add_field(
+        name="`d!r`",
+        value="Resume Pokétwo in **this channel**.",
+        inline=False,
+    )
+    embed.add_field(
+        name="`d!r all`",
+        value="Resume Pokétwo in **every channel** in the registered category.",
+        inline=False,
+    )
+    embed.add_field(
+        name="`d!set category <name or ID>`",
+        value="Register a Discord category for `d!p all` / `d!r all` and auto-pause. **Requires Administrator.**",
+        inline=False,
+    )
+    embed.add_field(
         name="`d!setrole <role>`",
         value="Set which role can use all bot commands. **Requires Administrator.**",
         inline=False,
     )
     embed.add_field(
         name="`d!clearres`",
-        value=(
-            "Wipe the server's reserved-pokemon memory. "
-            "Run this at the start of a new reserve cycle so stale reservations "
-            "don't cause unwanted `h!r remove` commands."
-        ),
+        value="Wipe the server's reserved-pokemon memory. Run at the start of a new reserve cycle.",
         inline=False,
     )
-    embed.add_field(
-        name="`d!help`",
-        value="Show this message.",
-        inline=False,
-    )
-    embed.set_footer(text=access_line)
+    embed.add_field(name="`d!help`", value="Show this message.", inline=False)
+    embed.set_footer(text=f"{access_line} | {cat_line}")
     await ctx.send(embed=embed)
 
+
+# --- d!set group -----------------------------------------------------------
+
+@bot.group(name="set", invoke_without_command=True)
+async def set_group(ctx: commands.Context):
+    """Command group for bot configuration (Admin only)."""
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.send("You need the **Administrator** permission to use this.")
+        return
+    await ctx.send(
+        "Available subcommands: `d!set category <name or ID>`"
+    )
+
+
+@set_group.command(name="category")
+async def set_category(ctx: commands.Context, *, category_input: str = ""):
+    """Register a Discord category channel for pause/resume operations."""
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.send("You need the **Administrator** permission to use this.")
+        return
+
+    if not category_input.strip():
+        await ctx.send(
+            "Please provide a category name or ID. "
+            "Example: `d!set category Pokétwo Channels`"
+        )
+        return
+
+    # Try to match by ID first, then by name (case-insensitive).
+    category: discord.CategoryChannel | None = None
+
+    if category_input.strip().isdigit():
+        ch = ctx.guild.get_channel(int(category_input.strip()))
+        if isinstance(ch, discord.CategoryChannel):
+            category = ch
+
+    if category is None:
+        needle = category_input.strip().lower()
+        for ch in ctx.guild.categories:
+            if ch.name.lower() == needle:
+                category = ch
+                break
+
+    if category is None:
+        await ctx.send(
+            f"Could not find a category matching **{category_input}**. "
+            "Make sure you're using the exact category name or its ID."
+        )
+        return
+
+    guild_categories[ctx.guild.id] = category.id
+    channel_count = len(
+        [c for c in category.channels if isinstance(c, discord.TextChannel)]
+    )
+    logger.info(
+        "set category: guild %s → category '%s' (%d) with %d text channels, set by %s",
+        ctx.guild.id, category.name, category.id, channel_count, ctx.author,
+    )
+    await ctx.send(
+        f"Done! Registered **{category.name}** ({channel_count} text channels) "
+        f"for pause/resume operations."
+    )
+
+
+# --- d!setrole -------------------------------------------------------------
 
 @bot.command(name="setrole")
 async def setrole(ctx: commands.Context, *, role_input: str = ""):
@@ -250,7 +460,6 @@ async def setrole(ctx: commands.Context, *, role_input: str = ""):
         return
 
     role: discord.Role | None = None
-
     try:
         role = await commands.RoleConverter().convert(ctx, role_input.strip())
     except commands.BadArgument:
@@ -277,6 +486,153 @@ async def setrole(ctx: commands.Context, *, role_input: str = ""):
     )
 
 
+# --- d!p (pause) -----------------------------------------------------------
+
+@bot.command(name="p")
+async def pause_cmd(ctx: commands.Context, *, arg: str = ""):
+    """
+    d!p       — Pause Pokétwo in this channel.
+    d!p all   — Pause Pokétwo in every channel of the registered category.
+    """
+    if not is_allowed(ctx):
+        await ctx.send(_access_denied_message(ctx))
+        return
+
+    poketwo = await _get_poketwo(ctx.guild)
+    if poketwo is None:
+        await ctx.send(
+            "Could not find Pokétwo in this server. "
+            "Make sure Pokétwo is a member of the server."
+        )
+        return
+
+    if arg.strip().lower() == "all":
+        # Pause all channels in the registered category.
+        channels = _registered_text_channels(ctx.guild)
+        if not channels:
+            cat_id = guild_categories.get(ctx.guild.id)
+            if cat_id is None:
+                await ctx.send(
+                    "No category has been registered yet. "
+                    "An Administrator must run `d!set category <name/ID>` first."
+                )
+            else:
+                await ctx.send("The registered category has no text channels.")
+            return
+
+        await ctx.send(f"⏸️ Pausing Pokétwo in **{len(channels)}** channel(s)...")
+        ok, fail = 0, 0
+        for ch in channels:
+            if await _pause_channel(ch, poketwo):
+                ok += 1
+            else:
+                fail += 1
+
+        summary = f"⏸️ Done — paused **{ok}** channel(s)."
+        if fail:
+            summary += f" Failed on **{fail}** channel(s) (missing permissions)."
+        await ctx.send(summary)
+
+    else:
+        # Pause only the current channel.
+        if not isinstance(ctx.channel, discord.TextChannel):
+            await ctx.send("This command can only be used in a text channel.")
+            return
+        success = await _pause_channel(ctx.channel, poketwo)
+        if success:
+            await ctx.send(
+                f"⏸️ Pokétwo has been paused in {ctx.channel.mention}.\n"
+                f"Use `{BOT_PREFIX}r` to resume."
+            )
+        else:
+            await ctx.send(
+                "Failed to pause Pokétwo here. "
+                "Make sure the bot has **Manage Channel** permissions."
+            )
+
+
+# --- d!r (resume) ----------------------------------------------------------
+
+@bot.command(name="r")
+async def resume_cmd(ctx: commands.Context, *, arg: str = ""):
+    """
+    d!r       — Resume Pokétwo in this channel.
+    d!r all   — Resume Pokétwo in every channel of the registered category.
+    """
+    if not is_allowed(ctx):
+        await ctx.send(_access_denied_message(ctx))
+        return
+
+    poketwo = await _get_poketwo(ctx.guild)
+    if poketwo is None:
+        await ctx.send(
+            "Could not find Pokétwo in this server. "
+            "Make sure Pokétwo is a member of the server."
+        )
+        return
+
+    if arg.strip().lower() == "all":
+        # Resume all channels in the registered category.
+        channels = _registered_text_channels(ctx.guild)
+        if not channels:
+            cat_id = guild_categories.get(ctx.guild.id)
+            if cat_id is None:
+                await ctx.send(
+                    "No category has been registered yet. "
+                    "An Administrator must run `d!set category <name/ID>` first."
+                )
+            else:
+                await ctx.send("The registered category has no text channels.")
+            return
+
+        await ctx.send(f"▶️ Resuming Pokétwo in **{len(channels)}** channel(s)...")
+        ok, fail = 0, 0
+        for ch in channels:
+            if await _resume_channel(ch, poketwo):
+                ok += 1
+            else:
+                fail += 1
+
+        summary = f"▶️ Done — resumed **{ok}** channel(s)."
+        if fail:
+            summary += f" Failed on **{fail}** channel(s) (missing permissions)."
+        await ctx.send(summary)
+
+    else:
+        # Resume only the current channel.
+        if not isinstance(ctx.channel, discord.TextChannel):
+            await ctx.send("This command can only be used in a text channel.")
+            return
+        success = await _resume_channel(ctx.channel, poketwo)
+        if success:
+            await ctx.send(f"▶️ Pokétwo has been resumed in {ctx.channel.mention}.")
+        else:
+            await ctx.send(
+                "Failed to resume Pokétwo here. "
+                "Make sure the bot has **Manage Channel** permissions."
+            )
+
+
+# --- d!clearres ------------------------------------------------------------
+
+@bot.command(name="clearres")
+async def clearres(ctx: commands.Context):
+    """Wipe the server's persistent reserved-pokemon memory."""
+    if not is_allowed(ctx):
+        await ctx.send(_access_denied_message(ctx))
+        return
+
+    count = len(guild_reserved.get(ctx.guild.id, set()))
+    guild_reserved[ctx.guild.id] = set()
+    logger.info(
+        "clearres: guild %s wiped %d reserved entries by %s",
+        ctx.guild.id, count, ctx.author,
+    )
+    await ctx.send(f"Done! Reserved-pokemon memory cleared ({count} entries removed).")
+
+
+# --- d!autores -------------------------------------------------------------
+
 @bot.command(name="autores")
 async def autores(ctx: commands.Context):
     """Parse a replied-to checklist and send all h!r commands one-by-one."""
@@ -297,8 +653,6 @@ async def autores(ctx: commands.Context):
 
     logger.info("autores triggered by %s in #%s", ctx.author, ctx.channel.name)
 
-    # Use the guild's persistent reserved set so pokemon reserved in previous
-    # runs are still known and trigger remove commands if they reappear.
     if ctx.guild.id not in guild_reserved:
         guild_reserved[ctx.guild.id] = set()
     reserved_set = guild_reserved[ctx.guild.id]
@@ -321,22 +675,7 @@ async def autores(ctx: commands.Context):
         await ctx.send(str(exc))
 
 
-@bot.command(name="clearres")
-async def clearres(ctx: commands.Context):
-    """
-    Wipe the server's persistent reserved-pokemon memory.
-    Run this at the start of a new reserve cycle so old reservations don't
-    trigger unwanted remove commands.
-    """
-    if not is_allowed(ctx):
-        await ctx.send(_access_denied_message(ctx))
-        return
-
-    count = len(guild_reserved.get(ctx.guild.id, set()))
-    guild_reserved[ctx.guild.id] = set()
-    logger.info("clearres: guild %s wiped %d reserved entries by %s", ctx.guild.id, count, ctx.author)
-    await ctx.send(f"Done! Reserved-pokemon memory cleared ({count} entries removed).")
-
+# --- d!preview -------------------------------------------------------------
 
 @bot.command(name="preview")
 async def preview(ctx: commands.Context):
