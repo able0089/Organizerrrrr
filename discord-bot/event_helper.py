@@ -38,7 +38,7 @@ SAVE_FILE = os.path.join(os.path.dirname(__file__), "event_data.json")
 #   3. Catch 6 Ground-type pokémon 0/6
 #   4. Catch 7 Ice-type pokémon 4/7
 QUEST_RE = re.compile(
-    r"(\d+)\.\s+(.+?)\s+(\d+)/(\d+)",
+    r"\*{0,2}(\d+)\*{0,2}\.\s+(.+?)\s+`?(\d+)/(\d+)`?",
     re.MULTILINE,
 )
 
