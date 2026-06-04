@@ -275,10 +275,24 @@ async def on_message(message: discord.Message):
     # Let command processing run first.
     await bot.process_commands(message)
 
-    # Only act on Pokétwo messages in a guild.
-    if message.author.id != POKETWO_ID:
+    # Ignore bot messages and DMs from here on.
+    if message.author.bot or message.guild is None:
         return
-    if message.guild is None:
+
+    # ------------------------------------------------------------------
+    # "quest" keyword: show the tracker for any user who has evhelp active.
+    # ------------------------------------------------------------------
+    if (
+        message.content.strip().lower() in ("quest", "quests")
+        and event_helper.is_active(message.guild.id, message.author.id)
+    ):
+        text = event_helper.get_tracker_text(message.guild, message.author.id)
+        if text:
+            await message.channel.send(text)
+        return
+
+    # Only act on Pokétwo messages beyond this point.
+    if message.author.id != POKETWO_ID:
         return
 
     # ------------------------------------------------------------------

@@ -24,7 +24,6 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, timezone
 
 import discord
 
@@ -39,7 +38,7 @@ SAVE_FILE = os.path.join(os.path.dirname(__file__), "event_data.json")
 #   3. Catch 6 Ground-type pokémon 0/6
 #   4. Catch 7 Ice-type pokémon 4/7
 QUEST_RE = re.compile(
-    r"\*{0,2}(\d+)\*{0,2}\.\s+(.+?)\s+(\d+)/(\d+)\b",
+    r"(\d+)\.\s+(.+?)\s+(\d+)/(\d+)",
     re.MULTILINE,
 )
 
@@ -169,6 +168,17 @@ class EventHelper:
     def get_state(self, guild_id: int, user_id: int) -> dict | None:
         return self._trackers.get((guild_id, user_id))
 
+    def get_tracker_text(self, guild: discord.Guild, user_id: int) -> str | None:
+        """Return the formatted tracker text for a user, or None if not tracking."""
+        key = (guild.id, user_id)
+        if key not in self._active:
+            return None
+        state = self._trackers.get(key)
+        if state is None:
+            return None
+        member = guild.get_member(user_id)
+        return self._format(state, member)
+
     # ------------------------------------------------------------------
     # Quest parsing
     # ------------------------------------------------------------------
@@ -226,8 +236,7 @@ class EventHelper:
 
     def _format(self, state: dict, member: discord.Member | None) -> str:
         mention = member.mention if member else f"<@{state['user_id']}>"
-        now = datetime.now().strftime("%H:%M")
-        lines = [f"🎯 **Quest Tracker — {mention}**", f"-# Updated {now}", ""]
+        lines = [f"🎯 **Quest Tracker — {mention}**", ""]
 
         quests: list[dict] = state["quests"]
         if not quests:
