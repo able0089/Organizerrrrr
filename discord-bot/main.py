@@ -38,6 +38,7 @@ import re
 import discord
 from discord.ext import commands
 
+from event_helper import EventHelper
 from keep_alive import keep_alive
 from parser import parse_checklist
 from queue_manager import QueueManager
@@ -88,6 +89,9 @@ guild_categories: dict[int, int] = {}
 
 # guild_id -> set of lowercase pokemon names reserved this cycle
 guild_reserved: dict[int, set[str]] = {}
+
+# Event quest tracker — persists to event_data.json
+event_helper = EventHelper()
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +281,33 @@ async def on_message(message: discord.Message):
     if message.guild is None:
         return
 
-    # Only in channels that belong to the registered category.
+    # ------------------------------------------------------------------
+    # Event quest tracking: if this Pokétwo message is a reply, check
+    # whether the original author has evhelp active and parse quests.
+    # ------------------------------------------------------------------
+    if message.reference is not None:
+        ref_author_id: int | None = None
+
+        # Try the cached resolved object first (faster, no API call).
+        ref = message.reference.resolved
+        if isinstance(ref, discord.Message):
+            ref_author_id = ref.author.id
+        else:
+            # Fall back to fetching the referenced message.
+            try:
+                ref_msg = await message.channel.fetch_message(
+                    message.reference.message_id
+                )
+                ref_author_id = ref_msg.author.id
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
+        if ref_author_id is not None:
+            await event_helper.handle_poketwo_reply(message, ref_author_id)
+
+    # ------------------------------------------------------------------
+    # Auto-pause: incense detection (only in registered category).
+    # ------------------------------------------------------------------
     registered = _registered_text_channels(message.guild)
     if message.channel not in registered:
         return
@@ -371,6 +401,20 @@ async def help_cmd(ctx: commands.Context):
     embed.add_field(
         name="`d!setrole <role>`",
         value="Set which role can use all bot commands. **Requires Administrator.**",
+        inline=False,
+    )
+    embed.add_field(
+        name="`d!evhelp`",
+        value=(
+            "Start tracking your Pokétwo event quests. "
+            "After running this, use `@Pokétwo ev q` and the bot will automatically "
+            "create and update a quest tracker for you."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="`d!evstop`",
+        value="Stop tracking your event quests.",
         inline=False,
     )
     embed.add_field(
@@ -611,6 +655,52 @@ async def resume_cmd(ctx: commands.Context, *, arg: str = ""):
                 "Failed to resume Pokétwo here. "
                 "Make sure the bot has **Manage Channel** permissions."
             )
+
+
+# --- d!evhelp / d!evstop --------------------------------------------------
+
+@bot.command(name="evhelp")
+async def evhelp(ctx: commands.Context):
+    """Start tracking your Pokétwo event quests in this channel."""
+    if not is_allowed(ctx):
+        await ctx.send(_access_denied_message(ctx))
+        return
+
+    already = event_helper.is_active(ctx.guild.id, ctx.author.id)
+    if already:
+        await ctx.send(
+            "You already have an active quest tracker. "
+            f"Use `{BOT_PREFIX}evstop` to stop it first, or just run `@Pokétwo ev q` to update your quests."
+        )
+        return
+
+    event_helper.enable(ctx.guild.id, ctx.author.id, ctx.channel.id)
+
+    # Post an empty tracker immediately so the user can see it.
+    state = event_helper.get_state(ctx.guild.id, ctx.author.id)
+    await event_helper._push_tracker(ctx.guild, state, ctx.channel)
+    event_helper._save()
+
+    logger.info("evhelp started by %s in #%s", ctx.author, ctx.channel.name)
+    await ctx.send(
+        f"✅ Quest tracking started! Now run `@Pokétwo ev q` to load your quests.\n"
+        "The tracker above will update automatically whenever Pokétwo replies to your ev command."
+    )
+
+
+@bot.command(name="evstop")
+async def evstop(ctx: commands.Context):
+    """Stop tracking your Pokétwo event quests."""
+    if not is_allowed(ctx):
+        await ctx.send(_access_denied_message(ctx))
+        return
+
+    was_active = event_helper.disable(ctx.guild.id, ctx.author.id)
+    if was_active:
+        logger.info("evstop by %s in #%s", ctx.author, ctx.channel.name)
+        await ctx.send("⏹️ Quest tracking stopped.")
+    else:
+        await ctx.send("You don't have an active quest tracker.")
 
 
 # --- d!ping ----------------------------------------------------------------

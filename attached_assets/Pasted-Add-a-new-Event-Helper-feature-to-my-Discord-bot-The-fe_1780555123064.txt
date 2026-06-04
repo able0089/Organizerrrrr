@@ -1,0 +1,52 @@
+Add a new Event Helper feature to my Discord bot.
+
+The feature should only start when an authorized user runs:
+
+d!evhelp
+
+Once enabled, the bot should watch for Pokétwo event quest embeds that are sent in response to that user's "@Pokétwo ev" or "@Pokétwo ev q" command.
+
+The bot should automatically read all active quests from the embed and create a quest tracker for that specific user.
+
+The tracker should show:
+- All active quests
+- Current progress
+- Which quests are completed
+- Remaining quests
+
+The bot must continuously update the tracker whenever the user's event quests change or progress increases.
+
+If a quest reaches completion, mark it with a ✅.
+
+The bot should always edit/update the existing tracker instead of creating new tracker messages.
+
+If the user runs "@Pokétwo ev" or "@Pokétwo ev q" again and receives a new quest list, the old quests should be replaced with the new ones automatically and tracking should continue.
+
+Multiple users may use this feature at the same time (2-4 users or more), so the bot must keep each user's quest tracker completely separate.
+
+Do NOT mix quest progress between users.
+
+Since Pokétwo replies directly to the user who used the event command, use that relationship to ensure quests are always assigned to the correct user.
+
+For example:
+- User A's tracker should only update from User A's event embeds.
+- User B's tracker should only update from User B's event embeds.
+
+The bot should remember all active trackers, user settings, categories, roles, and other configuration even after a bot restart.
+
+If the bot restarts, all existing trackers and settings should continue working without needing to be set up again.
+
+When all quests for a user are completed, immediately ping that user and send a notification that all active event quests have been completed.
+
+After completion, the bot should wait for the user to receive a new quest list before creating a new tracking cycle.
+
+Requirements:
+- Works in multiple servers.
+- Only authorized users can use it.
+- Supports multiple users tracking quests simultaneously.
+- Prevent duplicate trackers.
+- Prevent duplicate quest entries.
+- Proper error handling.
+- Detailed logging for quest detection, updates, completion, and tracker refreshes.
+- Clean, modular, production-ready code.
+- Efficient and lightweight since the bot is only used in a few servers.
